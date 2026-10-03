@@ -1,0 +1,273 @@
+import threading
+import time
+import traceback
+
+import requests
+
+from android_utils import log, run_on_ui_thread
+from base_plugin import BasePlugin
+from client_utils import get_messages_controller, get_user_config, send_request
+from hook_utils import find_class
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Input, Switch, Text
+
+__id__ = "lastfm_bio"
+__name__ = "Track in Bio"
+__description__ = "Shows the track you are listening to (via Last.fm) in your Telegram bio and restores the old bio when the music stops."
+__author__ = "@w9xeex"
+__version__ = "0.1.0"
+__icon__ = "Catz5Emoji/35"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.3"
+
+LASTFM_URL = "https://ws.audioscrobbler.com/2.0/"
+POLL_SECONDS = 30
+ERROR_COOLDOWN_SECONDS = 60
+BIO_LIMIT = 70
+PREFIX = "🎵 "
+BACKUP_KEY = "backup_about"
+
+# In different Telegram versions the request class lives under different names
+REQUEST_CLASS_NAMES = [
+    "org.telegram.tgnet.tl.TL_account$updateProfile",
+    "org.telegram.tgnet.TLRPC$TL_account_updateProfile",
+]
+
+
+def parse_now_playing(data):
+    """Returns (artist, title) if something is playing right now, otherwise None."""
+    tracks = data.get("recenttracks", {}).get("track", [])
+    if isinstance(tracks, dict):
+        tracks = [tracks]
+    if not tracks:
+        return None
+    track = tracks[0]
+    if track.get("@attr", {}).get("nowplaying") != "true":
+        return None
+    artist = track.get("artist", {}).get("#text", "") or ""
+    title = track.get("name", "") or ""
+    if not title:
+        return None
+    return artist, title
+
+
+def format_bio(artist, title):
+    text = PREFIX + (artist + " - " + title if artist else title)
+    if len(text) > BIO_LIMIT:
+        text = text[: BIO_LIMIT - 1] + "…"
+    return text
+
+
+class TrackInBioPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._stop = None
+        self._thread = None
+        self._shown = None
+        self._cooldown_until = 0
+
+    # ---------- lifecycle ----------
+    def on_plugin_load(self):
+        if self.get_setting("enabled", False):
+            self._start()
+
+    def on_plugin_unload(self):
+        self._stop_worker(restore=True)
+
+    # ---------- settings ----------
+    def create_settings(self):
+        return [
+            Header(text="Last.fm"),
+            Input(
+                key="api_key",
+                text="API-ключ Last.fm",
+                default="",
+                subtext="Получить: last.fm/api/account/create",
+                icon="msg_pin_code",
+            ),
+            Input(
+                key="username",
+                text="Логин Last.fm",
+                default="w9xeex",
+                icon="msg_contacts",
+            ),
+            Header(text="Работа"),
+            Switch(
+                key="enabled",
+                text="Показывать трек в био",
+                default=False,
+                subtext="Проверка каждые 30 секунд",
+                icon="msg_edit",
+                on_change=self._on_toggle,
+            ),
+            Text("Проверить Last.fm сейчас", icon="msg_retry", on_click=self.check_now),
+            Text("Вернуть прежнее био", icon="msg_undo", on_click=self.restore_now),
+            Divider("Перед включением убедись, что в био стоит твой обычный текст, а не прежний трек. Его копия сохраняется перед первой заменой."),
+        ]
+
+    def _on_toggle(self, value):
+        if value:
+            self._start()
+        else:
+            self._stop_worker(restore=True)
+
+    # ---------- worker ----------
+    def _start(self):
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._worker, args=(self._stop,), daemon=True)
+        self._thread.start()
+
+    def _stop_worker(self, restore):
+        if self._stop is not None:
+            self._stop.set()
+        self._thread = None
+        if restore and self._shown is not None:
+            self._restore()
+
+    def _worker(self, stop):
+        while not stop.is_set():
+            try:
+                self._tick()
+            except Exception:
+                log(traceback.format_exc())
+            stop.wait(POLL_SECONDS)
+
+    def _tick(self):
+        if time.time() < self._cooldown_until:
+            return
+        api_key = str(self.get_setting("api_key", "")).strip()
+        username = str(self.get_setting("username", "")).strip()
+        if not api_key or not username:
+            return
+        try:
+            track = self._fetch_now_playing(api_key, username)
+        except Exception as exc:
+            log("Last.fm request failed: " + str(exc))
+            return
+        if track is None:
+            if self._shown is not None:
+                self._restore()
+            return
+        text = format_bio(track[0], track[1])
+        if text == self._shown:
+            return
+        if not self._ensure_backup():
+            self._cooldown_until = time.time() + ERROR_COOLDOWN_SECONDS
+            return
+        self._send_bio(text)
+        self._shown = text
+
+    # ---------- Last.fm ----------
+    def _fetch_now_playing(self, api_key, username):
+        resp = requests.get(
+            LASTFM_URL,
+            params={
+                "method": "user.getrecenttracks",
+                "user": username,
+                "api_key": api_key,
+                "format": "json",
+                "limit": 1,
+            },
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("error"):
+            raise RuntimeError("Last.fm: " + str(data.get("message")))
+        return parse_now_playing(data)
+
+    # ---------- bio ----------
+    def _current_about(self):
+        try:
+            user_id = get_user_config().getClientUserId()
+            full = get_messages_controller().getUserFull(user_id)
+            if full is not None and full.about is not None:
+                return str(full.about)
+        except Exception:
+            log(traceback.format_exc())
+        return None
+
+    def _ensure_backup(self):
+        """Saves the user's real bio before the first replacement. False = it is unsafe to continue."""
+        if self.get_setting(BACKUP_KEY, None) is not None:
+            return True
+        current = self._current_about()
+        if current is None:
+            self._notify_error("Не удалось прочитать текущее био. Открой свой профиль и повтори")
+            return False
+        if current.startswith(PREFIX):
+            self._notify_error("В био уже трек. Верни обычный текст вручную и включи заново")
+            return False
+        self.set_setting(BACKUP_KEY, current)
+        return True
+
+    def _make_request(self):
+        for name in REQUEST_CLASS_NAMES:
+            try:
+                cls = find_class(name)
+            except Exception:
+                cls = None
+            if cls is not None:
+                return cls()
+        raise RuntimeError("класс updateProfile не найден")
+
+    def _send_bio(self, text):
+        try:
+            req = self._make_request()
+            req.flags = req.flags | 4  # 4 = the "about" field is set
+            req.about = text
+        except Exception:
+            log(traceback.format_exc())
+            return
+
+        def on_response(response, error):
+            if error:
+                log("updateProfile error: " + str(error.text))
+                self._shown = None
+                self._cooldown_until = time.time() + ERROR_COOLDOWN_SECONDS
+
+        try:
+            send_request(req, on_response)
+        except Exception:
+            log(traceback.format_exc())
+
+    def _restore(self):
+        backup = self.get_setting(BACKUP_KEY, None)
+        self._shown = None
+        if backup is not None:
+            self._send_bio(str(backup))
+
+    def _notify_error(self, text):
+        run_on_ui_thread(lambda: BulletinHelper.show_error(text))
+
+    # ---------- buttons ----------
+    def check_now(self, view=None):
+        api_key = str(self.get_setting("api_key", "")).strip()
+        username = str(self.get_setting("username", "")).strip()
+        if not api_key or not username:
+            BulletinHelper.show_error("Впиши API-ключ и логин Last.fm")
+            return
+
+        def job():
+            try:
+                track = self._fetch_now_playing(api_key, username)
+            except Exception as exc:
+                msg = "Last.fm: " + str(exc)
+                run_on_ui_thread(lambda: BulletinHelper.show_error(msg[:150]))
+                return
+            if track is None:
+                run_on_ui_thread(lambda: BulletinHelper.show_info("Сейчас ничего не играет"))
+            else:
+                msg = "Играет: " + format_bio(track[0], track[1])
+                run_on_ui_thread(lambda: BulletinHelper.show_success(msg))
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def restore_now(self, view=None):
+        if self.get_setting(BACKUP_KEY, None) is None:
+            BulletinHelper.show_error("Нет сохранённого био")
+            return
+        self._restore()
+        BulletinHelper.show_success("Прежнее био возвращено")
