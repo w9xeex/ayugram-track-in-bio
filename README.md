@@ -35,6 +35,7 @@ Get an API key here: https://www.last.fm/api/account/create
 - The plugin only works while the app is running. Allow AyuGram and your scrobbler to run in the background (battery setting: unrestricted).
 - Your API key is stored in the plugin settings on your phone, not in this repository.
 - Last.fm may show "now playing" with a delay of a minute or two.
+- Tested with [Lane](https://sklane.com/ru) as the primary music player.
 
 ## Status
 
