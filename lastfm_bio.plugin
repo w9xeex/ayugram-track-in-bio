@@ -15,15 +15,23 @@ __id__ = "lastfm_bio"
 __name__ = "Track in Bio"
 __description__ = "Shows the track you are listening to (via Last.fm) in your Telegram bio and restores the old bio when the music stops."
 __author__ = "@w9xeex"
-__version__ = "0.1.0"
-__icon__ = "Catz5Emoji/35"
+__version__ = "0.3.1"
+__icon__ = "uniposting/0"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.3.3"
 
 LASTFM_URL = "https://ws.audioscrobbler.com/2.0/"
-POLL_SECONDS = 30
+DEFAULT_POLL_SECONDS = 10
+MIN_POLL_SECONDS = 5
+MAX_POLL_SECONDS = 120
+MIN_UPDATE_GAP_SECONDS = 10  # protection from Telegram flood limits
 ERROR_COOLDOWN_SECONDS = 60
 BIO_LIMIT = 70
+STALE_MARGIN_SECONDS = 45     # how long after the expected track end we still trust "now playing"
+FALLBACK_TRACK_SECONDS = 300  # used when Last.fm does not know the track length
+MIN_TRACK_SECONDS = 60
+MAX_TRACK_SECONDS = 1800
+REPLAY_GAP_SECONDS = 20
 PREFIX = "🎵 "
 BACKUP_KEY = "backup_about"
 
@@ -35,7 +43,8 @@ REQUEST_CLASS_NAMES = [
 
 
 def parse_now_playing(data):
-    """Returns (artist, title) if something is playing right now, otherwise None."""
+    """Returns (artist, title, prev_uts) if something is playing right now, otherwise None.
+    prev_uts is the start time of the previous scrobble if it was the same track, else 0."""
     tracks = data.get("recenttracks", {}).get("track", [])
     if isinstance(tracks, dict):
         tracks = [tracks]
@@ -48,7 +57,16 @@ def parse_now_playing(data):
     title = track.get("name", "") or ""
     if not title:
         return None
-    return artist, title
+    prev_uts = 0
+    if len(tracks) > 1:
+        prev = tracks[1]
+        same = (prev.get("artist", {}).get("#text", "") or "") == artist and (prev.get("name", "") or "") == title
+        if same:
+            try:
+                prev_uts = int(prev.get("date", {}).get("uts", 0))
+            except Exception:
+                prev_uts = 0
+    return artist, title, prev_uts
 
 
 def format_bio(artist, title):
@@ -58,6 +76,38 @@ def format_bio(artist, title):
     return text
 
 
+class StaleGuard:
+    """Stops trusting a 'now playing' status that has lasted longer than the track itself."""
+
+    def __init__(self):
+        self.key = None
+        self.started = 0
+        self.ignored = False
+
+    def clear(self):
+        self.key = None
+        self.ignored = False
+
+    def update(self, key, prev_uts, now):
+        if key != self.key:
+            self.key = key
+            self.started = now
+            self.ignored = False
+        elif prev_uts and prev_uts > self.started + REPLAY_GAP_SECONDS:
+            # the same track was started again (repeat): a new play began later than we recorded
+            self.started = prev_uts
+            self.ignored = False
+
+    def check(self, now, duration):
+        """True if the track should still be shown."""
+        if self.ignored:
+            return False
+        if now - self.started > duration + STALE_MARGIN_SECONDS:
+            self.ignored = True
+            return False
+        return True
+
+
 class TrackInBioPlugin(BasePlugin):
     def __init__(self):
         super().__init__()
@@ -65,6 +115,9 @@ class TrackInBioPlugin(BasePlugin):
         self._thread = None
         self._shown = None
         self._cooldown_until = 0
+        self._last_sent = 0
+        self._guard = StaleGuard()
+        self._durations = {}
 
     # ---------- lifecycle ----------
     def on_plugin_load(self):
@@ -92,11 +145,17 @@ class TrackInBioPlugin(BasePlugin):
                 icon="msg_contacts",
             ),
             Header(text="Работа"),
+            Input(
+                key="poll_seconds",
+                text="Интервал проверки, сек",
+                default=str(DEFAULT_POLL_SECONDS),
+                subtext="От 5 до 120. Чем меньше, тем быстрее реакция",
+            ),
             Switch(
                 key="enabled",
                 text="Показывать трек в био",
                 default=False,
-                subtext="Проверка каждые 30 секунд",
+                subtext="Трек в био, пока играет музыка",
                 icon="msg_edit",
                 on_change=self._on_toggle,
             ),
@@ -132,7 +191,14 @@ class TrackInBioPlugin(BasePlugin):
                 self._tick()
             except Exception:
                 log(traceback.format_exc())
-            stop.wait(POLL_SECONDS)
+            stop.wait(self._poll_interval())
+
+    def _poll_interval(self):
+        try:
+            value = int(str(self.get_setting("poll_seconds", str(DEFAULT_POLL_SECONDS))).strip())
+        except Exception:
+            value = DEFAULT_POLL_SECONDS
+        return max(MIN_POLL_SECONDS, min(MAX_POLL_SECONDS, value))
 
     def _tick(self):
         if time.time() < self._cooldown_until:
@@ -147,11 +213,23 @@ class TrackInBioPlugin(BasePlugin):
             log("Last.fm request failed: " + str(exc))
             return
         if track is None:
+            self._guard.clear()
+            if self._shown is not None:
+                self._restore()
+            return
+        now = time.time()
+        self._guard.update(track[0] + "\x00" + track[1], track[2], now)
+        if not self._guard.ignored:
+            duration = self._duration(api_key, track[0], track[1])
+            self._guard.check(now, duration)
+        if self._guard.ignored:
             if self._shown is not None:
                 self._restore()
             return
         text = format_bio(track[0], track[1])
         if text == self._shown:
+            return
+        if time.time() - self._last_sent < MIN_UPDATE_GAP_SECONDS:
             return
         if not self._ensure_backup():
             self._cooldown_until = time.time() + ERROR_COOLDOWN_SECONDS
@@ -168,7 +246,7 @@ class TrackInBioPlugin(BasePlugin):
                 "user": username,
                 "api_key": api_key,
                 "format": "json",
-                "limit": 1,
+                "limit": 2,
             },
             timeout=8,
         )
@@ -177,6 +255,37 @@ class TrackInBioPlugin(BasePlugin):
         if data.get("error"):
             raise RuntimeError("Last.fm: " + str(data.get("message")))
         return parse_now_playing(data)
+
+    def _duration(self, api_key, artist, title):
+        cache_key = (artist, title)
+        if cache_key in self._durations:
+            return self._durations[cache_key]
+        seconds = FALLBACK_TRACK_SECONDS
+        try:
+            resp = requests.get(
+                LASTFM_URL,
+                params={
+                    "method": "track.getInfo",
+                    "artist": artist,
+                    "track": title,
+                    "api_key": api_key,
+                    "format": "json",
+                    "autocorrect": 1,
+                },
+                timeout=8,
+            )
+            resp.raise_for_status()
+            millis = int(resp.json().get("track", {}).get("duration", "0") or 0)
+            if millis > 0:
+                seconds = millis / 1000.0
+            seconds = max(MIN_TRACK_SECONDS, min(MAX_TRACK_SECONDS, seconds))
+            if len(self._durations) > 200:
+                self._durations.clear()
+            self._durations[cache_key] = seconds
+        except Exception as exc:
+            log("track.getInfo failed: " + str(exc))
+            seconds = max(MIN_TRACK_SECONDS, min(MAX_TRACK_SECONDS, seconds))
+        return seconds
 
     # ---------- bio ----------
     def _current_about(self):
@@ -214,6 +323,7 @@ class TrackInBioPlugin(BasePlugin):
         raise RuntimeError("класс updateProfile не найден")
 
     def _send_bio(self, text):
+        self._last_sent = time.time()
         try:
             req = self._make_request()
             req.flags = req.flags | 4  # 4 = the "about" field is set
